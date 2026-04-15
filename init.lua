@@ -23,6 +23,9 @@ obj.clipboardDelayMicros = 500000
 --- Enable verbose logging for troubleshooting.
 obj.debugLogging = true
 
+--- Subdirectory name for screenshots relative to the org target file.
+obj.screenshotImageDir = "images"
+
 require("hs.ipc")
 
 if not hs.ipc.cliStatus() then
@@ -140,12 +143,29 @@ end
 
 -- Clipboard -------------------------------------------------------------
 
-function obj:performCopyAndCheck()
+function obj:performCopyAndCheck(uri)
    local originalContent = hs.pasteboard.getContents()
    hs.eventtap.keyStroke({"cmd"}, "c")
    hs.timer.usleep(self.clipboardDelayMicros)
    local newContent = hs.pasteboard.getContents()
-   return newContent ~= originalContent
+   if newContent == originalContent then return false end
+   -- If the copied text matches the already-retrieved URI, it's not a
+   -- genuine text selection.  This catches browser extensions (e.g.
+   -- StopTheMadness) that copy the page URL on Cmd-C when nothing is
+   -- selected.  Trimming handles trailing whitespace/newlines.
+   if uri and newContent then
+      local trimmed = newContent:gsub("^%s+", ""):gsub("%s+$", "")
+      if trimmed == uri then
+         self:log("clipboard matches URI, ignoring as selection")
+         if originalContent then
+            hs.pasteboard.setContents(originalContent)
+         else
+            hs.pasteboard.clearContents()
+         end
+         return false
+      end
+   end
+   return true
 end
 
 -- Elisp argument formatting ---------------------------------------------
@@ -165,9 +185,38 @@ local function formatElispBool(val)
    return val and "t" or "nil"
 end
 
+-- Screenshot ------------------------------------------------------------
+
+local function takeScreenshot(mode, windowId)
+   local tmpPath = "/tmp/orgcapture-" .. os.date("%Y%m%d-%H%M%S") .. ".png"
+   local args
+   if mode == "screen" then
+      args = {"-x", tmpPath}
+   elseif mode == "window" then
+      args = {"-x", "-l" .. tostring(windowId), tmpPath}
+   elseif mode == "selection" then
+      args = {"-x", "-i", tmpPath}
+   else
+      return nil
+   end
+   local task = hs.task.new("/usr/sbin/screencapture", nil, args)
+   task:start()
+   task:waitUntilExit()
+   if task:terminationStatus() ~= 0 then
+      return nil
+   end
+   -- Verify file was created
+   local f = io.open(tmpPath, "r")
+   if f then
+      f:close()
+      return tmpPath
+   end
+   return nil
+end
+
 -- Begin capture ---------------------------------------------------------
 
-function obj:beginOrgCapture()
+function obj:beginOrgCapture(screenshotPath)
    local w = hs.window.focusedWindow()
    if not w then
       self:log("no focused window")
@@ -200,17 +249,18 @@ function obj:beginOrgCapture()
    self:log("URI: " .. (uri or "nil"))
 
    -- Clipboard copy (best-effort)
-   local useClipboard = self:performCopyAndCheck()
+   local useClipboard = self:performCopyAndCheck(uri)
    self:log("clipboard copied: " .. tostring(useClipboard))
 
    -- Build elisp sexp
-   local elisp = string.format("(org-capture-hs-begin %s %s %d %s %s %s)",
+   local elisp = string.format("(org-capture-hs-begin %s %s %d %s %s %s %s)",
       formatElispString(appName),
       formatElispString(bundleId),
       windowId,
       formatElispString(windowTitle),
       formatElispString(uri),
-      formatElispBool(useClipboard))
+      formatElispBool(useClipboard),
+      formatElispString(screenshotPath))
 
    self:log("elisp: " .. elisp)
 
@@ -232,6 +282,136 @@ function obj:beginOrgCapture()
       self:log("failed to launch emacsclient task")
       hs.alert("Failed to start emacsclient")
    end
+end
+
+-- Screenshot capture entry points ---------------------------------------
+
+-- Core: take screenshot, then gather URI/clipboard, launch org-capture.
+-- Screenshot is taken FIRST so that URI retrieval keystrokes (Cmd-L etc.)
+-- and clipboard copy (Cmd-C) do not pollute the captured image.
+local function screenshotAndCapture(obj, mode, ctx)
+   obj:log("screenshot mode: " .. mode)
+
+   local screenshotPath = takeScreenshot(mode, ctx.windowId)
+   if not screenshotPath then
+      obj:log("screenshot failed or cancelled")
+      if mode == "selection" then return end
+      hs.alert("Screenshot failed")
+      return
+   end
+   obj:log("screenshot saved: " .. screenshotPath)
+
+   -- Now safe to gather URI and clipboard (may trigger keystrokes/popups)
+   local uri = obj:getURI(ctx.appName)
+   obj:log("URI: " .. (uri or "nil"))
+   local useClipboard = obj:performCopyAndCheck(uri)
+   obj:log("clipboard copied: " .. tostring(useClipboard))
+
+   local elisp = string.format("(org-capture-hs-begin %s %s %d %s %s %s %s)",
+      formatElispString(ctx.appName),
+      formatElispString(ctx.bundleId),
+      ctx.windowId,
+      formatElispString(ctx.windowTitle),
+      formatElispString(uri),
+      formatElispBool(useClipboard),
+      formatElispString(screenshotPath))
+
+   obj:log("elisp: " .. elisp)
+
+   local task = hs.task.new(obj.emacsClientPath,
+      function(exitCode, stdOut, stdErr)
+         if exitCode ~= 0 then
+            obj:log("emacsclient failed: rc=" .. tostring(exitCode)
+                    .. " stderr=" .. (stdErr or ""))
+            hs.alert("Failed to start org-capture in Emacs")
+         end
+      end,
+      {"-e", elisp, "-n"})
+
+   ctx.emacs:activate()
+   if not task:start() then
+      obj:log("failed to launch emacsclient task")
+      hs.alert("Failed to start emacsclient")
+   end
+end
+
+-- Gather basic context (no keystrokes, no side effects).
+-- URI and clipboard are gathered AFTER the screenshot.
+-- Returns context table on success, nil on failure.
+function obj:gatherScreenshotContext()
+   local w = hs.window.focusedWindow()
+   if not w then
+      self:log("no focused window")
+      hs.alert("No focused window found")
+      return nil
+   end
+
+   local app = w:application()
+   local appName = safeAppName(app) or "Unknown"
+
+   if appName == self.emacsAppName then
+      self:log("already in Emacs, ignoring")
+      hs.alert("Already in " .. self.emacsAppName .. ". Ignoring request")
+      return nil
+   end
+
+   local emacs = hs.application.find(self.emacsAppName)
+   if not emacs then
+      self:log("Emacs not found")
+      hs.alert("No " .. self.emacsAppName .. " found. Ignoring request")
+      return nil
+   end
+
+   return {
+      appName = appName,
+      bundleId = app:bundleID() or "",
+      windowId = w:id() or 0,
+      windowTitle = safeWindowTitle(w),
+      emacs = emacs
+   }
+end
+
+--- Capture a screenshot with a chooser (Screen/Window/Selection).
+function obj:beginScreenshotCapture()
+   local ctx = self:gatherScreenshotContext()
+   if not ctx then return end
+
+   local self_ = self
+   local chooser = hs.chooser.new(function(choice)
+      if not choice then
+         self_:log("screenshot chooser cancelled")
+         return
+      end
+      screenshotAndCapture(self_, choice.mode, ctx)
+   end)
+
+   chooser:choices({
+      {text = "Screen",    subText = "Capture the entire screen",     mode = "screen"},
+      {text = "Window",    subText = "Capture the focused window",    mode = "window"},
+      {text = "Selection", subText = "Select a region to capture",    mode = "selection"},
+   })
+   chooser:show()
+end
+
+--- Capture the entire screen directly (no chooser).
+function obj:beginScreenshotScreen()
+   local ctx = self:gatherScreenshotContext()
+   if not ctx then return end
+   screenshotAndCapture(self, "screen", ctx)
+end
+
+--- Capture the focused window directly (no chooser).
+function obj:beginScreenshotWindow()
+   local ctx = self:gatherScreenshotContext()
+   if not ctx then return end
+   screenshotAndCapture(self, "window", ctx)
+end
+
+--- Capture an interactive selection directly (no chooser).
+function obj:beginScreenshotSelection()
+   local ctx = self:gatherScreenshotContext()
+   if not ctx then return end
+   screenshotAndCapture(self, "selection", ctx)
 end
 
 -- Return to source window/app ------------------------------------------
@@ -288,7 +468,11 @@ obj._functionDef = nil
 
 function obj:bindHotkeys(mapping)
    local def = {
-      org_capture = function() self:beginOrgCapture() end
+      org_capture = function() self:beginOrgCapture() end,
+      org_capture_screenshot = function() self:beginScreenshotCapture() end,
+      org_capture_screenshot_screen = function() self:beginScreenshotScreen() end,
+      org_capture_screenshot_window = function() self:beginScreenshotWindow() end,
+      org_capture_screenshot_selection = function() self:beginScreenshotSelection() end
    }
    hs.spoons.bindHotkeysToSpec(def, mapping)
    self.functionMap = mapping

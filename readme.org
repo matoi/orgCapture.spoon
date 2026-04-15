@@ -13,11 +13,21 @@ This Hammerspoon Spoon launches =org-capture= in Emacs with context from the cur
 5. =C-c C-c= finalizes capture and returns focus to the source window.
 6. =C-c C-k= cancels capture and returns focus to the source window.
 
+A separate hotkey triggers screenshot capture:
+
+1. User presses the screenshot hotkey (chooser or direct mode).
+2. The screenshot is taken immediately (before any URI/clipboard retrieval).
+3. Hammerspoon gathers context (URI, clipboard) after the screenshot.
+4. Emacs opens a capture frame with the screenshot as an inline image.
+5. User can optionally run =M-x org-capture-hs-run-ocr= to extract and insert OCR text.
+6. =C-c C-k= cancels and deletes the screenshot file.
+
 * Requirements
 
 - Hammerspoon
 - Emacs with =org-mode= and a running =emacsclient= server
 - =hs= CLI (installed automatically by Hammerspoon's =hs.ipc= module)
+- Swift runtime (included with macOS; used for OCR)
 
 * Installation
 
@@ -35,7 +45,11 @@ Add to =~/.hammerspoon/init.lua=:
 hs.loadSpoon("orgCapture")
 if spoon.orgCapture then
    spoon.orgCapture:bindHotkeys({
-      org_capture = { {"alt"}, "o" }
+      org_capture                    = { {"alt"}, "o" },
+      org_capture_screenshot         = { {"alt", "shift"}, "o" },
+      org_capture_screenshot_screen  = { {"alt", "ctrl"}, "1" },
+      org_capture_screenshot_window  = { {"alt", "ctrl"}, "2" },
+      org_capture_screenshot_selection = { {"alt", "ctrl"}, "3" },
    })
 end
 #+end_src
@@ -54,6 +68,9 @@ spoon.orgCapture.clipboardDelayMicros = 500000
 
 -- Enable debug logging to Hammerspoon Console (default: true)
 spoon.orgCapture.debugLogging = true
+
+-- Subdirectory name for screenshots relative to the org target file (default: "images")
+spoon.orgCapture.screenshotImageDir = "images"
 #+end_src
 
 ** Emacs
@@ -72,8 +89,7 @@ The generic layer works out of the box with minimal defaults. For a more useful 
 
 #+begin_src emacs-lisp
 ;; Template function: receives context plist, returns an org-capture
-;; template string.  Context keys: :app-name, :bundle-id, :window-id,
-;; :window-title, :uri, :use-clipboard.
+;; template string (see "Writing a template function" below).
 (setq org-capture-hs-template-function #'my-template-function)
 
 ;; Target function: receives context plist, returns an org-capture
@@ -97,7 +113,112 @@ Other customization options:
 ;; (setq org-capture-hs-frame-left 100)
 ;; (setq org-capture-hs-frame-top 100)
 ;; (setq org-capture-hs-frame-parameters '((alpha . 0.95)))
+
+;; Subdirectory for screenshot images relative to capture target (default: "images")
+(setq org-capture-hs-screenshot-subdir "images")
 #+end_src
+
+*** Writing a template function
+
+The template function receives a single context plist and must return an org-capture template string. The context plist contains the following keys:
+
+| Key                | Type    | Description                                                        |
+|--------------------+---------+--------------------------------------------------------------------|
+| =:app-name=        | string  | Source application name (e.g. "Safari")                            |
+| =:bundle-id=       | string  | Source application bundle identifier                               |
+| =:window-id=       | integer | Numeric window identifier                                          |
+| =:window-title=    | string  | Source window title                                                |
+| =:uri=             | string  | URL or file path from the source (nil if unavailable)              |
+| =:use-clipboard=   | boolean | Whether the clipboard contains a genuine text selection            |
+| =:screenshot-path= | string  | Absolute path of the placed screenshot (nil if none)               |
+| =:screenshot-rel=  | string  | Relative path for use in =[[file:]]= links (nil if none)          |
+
+*Important*: user-controlled strings (titles, URIs, file paths, OCR text) may contain =%= characters, which org-capture interprets as expansion sequences (=%U=, =%?=, etc.). Always escape them with =org-capture-hs-escape-percent= before embedding in the template. Do *not* escape the template's own org-capture sequences like =%?=, =%U=, =%(...)=.
+
+*Important*: build the template with =concat=, not =format=. Using =format= would collapse the =%%=-escaping back into bare =%=.
+
+**** Example: minimal template with screenshot support
+
+#+begin_src emacs-lisp
+(defun my-template-function (context)
+  "Build a capture template with optional screenshot."
+  (let* ((uri (plist-get context :uri))
+         (title (plist-get context :window-title))
+         (screenshot-rel (plist-get context :screenshot-rel))
+         (heading (org-capture-hs-escape-percent
+                   (if uri
+                       (org-capture-hs--make-org-link uri title)
+                     (or title "capture")))))
+    (concat
+     "* " heading "\n"
+     (when screenshot-rel
+       (concat "[[file:"
+               (org-capture-hs-escape-percent screenshot-rel)
+               "]]\n"))
+     "%?\n")))
+#+end_src
+
+**** Example: full template with properties, tags, clipboard, and screenshot
+
+#+begin_src emacs-lisp
+(defun my-full-template-function (context)
+  "Full capture template with tags, properties, clipboard, and screenshot."
+  (let* ((app-name (plist-get context :app-name))
+         (title (plist-get context :window-title))
+         (uri (plist-get context :uri))
+         (use-clipboard (plist-get context :use-clipboard))
+         (screenshot-rel (plist-get context :screenshot-rel))
+         ;; Tag derived from app name (spaces removed, lowercased)
+         (tag (if app-name
+                  (replace-regexp-in-string "\\s-" "" (downcase app-name))
+                "app"))
+         (heading (org-capture-hs-escape-percent
+                   (if uri
+                       (org-capture-hs--make-org-link uri title)
+                     (or title app-name "capture")))))
+    (concat
+     "* " heading " :" tag ":note:\n"
+     ":PROPERTIES:\n"
+     ":ID:       %(org-id-new)\n"
+     ":CREATED:  %U\n"
+     ":END:\n\n"
+     (when screenshot-rel
+       (concat "[[file:"
+               (org-capture-hs-escape-percent screenshot-rel)
+               "]]\n\n"))
+     (when use-clipboard
+       (concat "#+begin_quote\n"
+               (org-capture-hs-escape-percent (current-kill 0 t)) "\n"
+               "#+end_quote\n\n"))
+     "%?\n")))
+#+end_src
+
+OCR text is not included in templates. Use =M-x org-capture-hs-run-ocr= in the capture buffer to insert it on demand.
+
+* Screenshot capture
+
+Screenshot capture can be triggered via a chooser or directly per mode:
+
+| Hotkey action                      | Behavior                                      |
+|------------------------------------+-----------------------------------------------|
+| =org_capture_screenshot=           | Opens a chooser (Screen / Window / Selection) |
+| =org_capture_screenshot_screen=    | Captures the entire screen directly            |
+| =org_capture_screenshot_window=    | Captures the focused window directly           |
+| =org_capture_screenshot_selection= | Interactive region selection directly           |
+
+The screenshot is taken *before* URI and clipboard retrieval, so browser popups (address bar activation, extension UI such as StopTheMadness) do not appear in the captured image.
+
+The screenshot image is saved in a subdirectory (default =images/=) alongside the target org file, and embedded as an inline =[[file:]]= link. If the capture is cancelled with =C-c C-k=, the screenshot file is automatically deleted.
+
+** OCR
+
+OCR is available as an on-demand command in the capture buffer:
+
+#+begin_src
+M-x org-capture-hs-run-ocr
+#+end_src
+
+This runs =ocr-screenshot.swift= (macOS Vision framework, supports English and Japanese) on the associated screenshot and inserts the recognized text at point in a =#+begin_quote= block. OCR is not performed automatically.
 
 * Supported URI sources
 
@@ -118,6 +239,8 @@ When a URI is available, the capture heading is an org-mode link: =[[url][title]
 
 If text is selected in the source application when the hotkey is pressed, Hammerspoon attempts to copy it via =Cmd-C=. Whether the copy succeeded is passed to the template function as =:use-clipboard=. The template function decides how to incorporate clipboard contents (e.g., as a quote block). Capture works regardless of whether clipboard content is available.
 
+To avoid false positives from browser extensions that copy the page URL on =Cmd-C= when no text is selected (e.g. StopTheMadness), the copied text is compared against the already-retrieved URI. If they match, the clipboard change is not treated as a text selection and the original clipboard is restored.
+
 * Testing
 
 ** Automated tests
@@ -135,12 +258,21 @@ emacs --batch -Q -L . -l test-org-capture-hs.el -f ert-run-tests-batch-and-exit
 - =C-c C-c=: finalizes and returns focus to the source window.
 - =C-c C-k=: cancels (with confirmation) and returns focus.
 - Multiple captures: verify contexts do not interfere.
+- Screenshot (Screen): verify full screen capture, image saved in =images/= dir, inline link in entry.
+- Screenshot (Window): verify focused window capture.
+- Screenshot (Selection): verify interactive selection; cancelling selection does not proceed.
+- Screenshot: verify no browser popups (address bar, extension UI) appear in the captured image.
+- Screenshot cancel: =C-c C-k= deletes the screenshot file from =images/= dir.
+- Screenshot OCR: =M-x org-capture-hs-run-ocr= inserts recognized text in a quote block.
+- Clipboard with StopTheMadness: verify URL-only copy (no text selected) is not treated as a selection.
 
 * Limitations
 
 - Firefox and Zen URI retrieval uses keystrokes to grab the URL from the address bar. This briefly activates the address bar and restores focus; it may not work with unusual browser configurations.
 - The hotkey is disabled while Emacs is in the foreground to avoid accidental triggers.
-- Clipboard copy relies on standard =Cmd-C=. Applications with non-standard clipboard behavior may not work.
+- Clipboard copy relies on standard =Cmd-C=. Browser extensions that modify =Cmd-C= behavior (e.g. StopTheMadness) are handled by comparing the clipboard against the retrieved URI; the clipboard change is ignored if they match.
+- Screenshot capture via =screencapture= requires Screen Recording permission in System Settings > Privacy & Security.
+- OCR runs as a Swift script (=swift ocr-screenshot.swift=) which has ~1–2 second startup overhead due to JIT compilation. Pre-compile with =swiftc -O -o ocr-screenshot ocr-screenshot.swift= if faster execution is needed.
 
 * Troubleshooting
 

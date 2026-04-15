@@ -167,6 +167,107 @@ If format were used, %% would collapse to % and corrupt the template."
   (let ((uri nil))
     (should (null (unless (or (null uri) (equal uri "")) uri)))))
 
+;;; --- org-capture-hs--screenshot-relative-path ---
+
+(ert-deftest test-screenshot-relative-path/basic ()
+  "Relative path from org dir to screenshot in images subdir."
+  (should (equal "images/shot.png"
+                 (org-capture-hs--screenshot-relative-path
+                  "/home/user/org/images/shot.png"
+                  '(file "/home/user/org/notes.org")))))
+
+(ert-deftest test-screenshot-relative-path/nil ()
+  "nil screenshot path returns nil."
+  (should (null (org-capture-hs--screenshot-relative-path
+                 nil '(file "/home/user/org/notes.org")))))
+
+(ert-deftest test-screenshot-relative-path/nested-target ()
+  "Relative path works with nested org file directories."
+  (should (equal "images/shot.png"
+                 (org-capture-hs--screenshot-relative-path
+                  "/home/user/org/daily/images/shot.png"
+                  '(file "/home/user/org/daily/2026-04-15.org")))))
+
+(ert-deftest test-screenshot-relative-path/fallback-default-notes-file ()
+  "Non-file target falls back to `org-default-notes-file'."
+  (let ((org-default-notes-file "/home/user/org/notes.org"))
+    (should (equal "images/shot.png"
+                   (org-capture-hs--screenshot-relative-path
+                    "/home/user/org/images/shot.png"
+                    '(clock))))))
+
+;;; --- org-capture-hs--place-screenshot ---
+
+(ert-deftest test-place-screenshot/moves-file ()
+  "Screenshot is moved from tmp to images subdir alongside target."
+  (let* ((tmp-dir (make-temp-file "hs-test" t))
+         (org-dir (make-temp-file "hs-org" t))
+         (tmp-png (expand-file-name "orgcapture-test.png" tmp-dir))
+         (org-file (expand-file-name "notes.org" org-dir))
+         (org-capture-hs-screenshot-subdir "images"))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp-png (insert "fake png"))
+          (let ((result (org-capture-hs--place-screenshot
+                         tmp-png `(file ,org-file))))
+            ;; Returns the final path
+            (should result)
+            (should (string-match-p "/images/orgcapture-test\\.png$" result))
+            ;; File exists at destination
+            (should (file-exists-p result))
+            ;; File removed from tmp
+            (should-not (file-exists-p tmp-png))))
+      (delete-directory tmp-dir t)
+      (delete-directory org-dir t))))
+
+(ert-deftest test-place-screenshot/nil-path ()
+  "nil tmp-path returns nil without error."
+  (should (null (org-capture-hs--place-screenshot
+                 nil '(file "/tmp/notes.org")))))
+
+(ert-deftest test-place-screenshot/nonexistent-file ()
+  "Non-existent tmp file returns nil."
+  (should (null (org-capture-hs--place-screenshot
+                 "/tmp/no-such-file-12345.png"
+                 '(file "/tmp/notes.org")))))
+
+;;; --- org-capture-hs-default-template with screenshot/OCR ---
+
+(ert-deftest test-default-template/with-screenshot ()
+  "Template includes inline file link when screenshot-rel is present."
+  (let* ((ctx '(:app-name "Safari"
+                :window-title "Page"
+                :uri nil
+                :screenshot-rel "images/shot.png"))
+         (tmpl (org-capture-hs-default-template ctx)))
+    (should (string-match-p "\\[\\[file:images/shot\\.png\\]\\]" tmpl))))
+
+(ert-deftest test-default-template/no-screenshot ()
+  "Template without screenshot matches original behavior."
+  (let* ((ctx '(:app-name "Safari" :window-title "My Page" :uri nil))
+         (tmpl (org-capture-hs-default-template ctx)))
+    (should (equal "* My Page\n%?\n" tmpl))))
+
+(ert-deftest test-default-template/screenshot-with-percent ()
+  "Percent in screenshot path is escaped for org-capture."
+  (let* ((ctx '(:app-name "Test"
+                :window-title "Page"
+                :uri nil
+                :screenshot-rel "images/100%25done.png"))
+         (tmpl (org-capture-hs-default-template ctx)))
+    ;; % in path must be doubled
+    (should (string-match-p "100%%25done" tmpl))))
+
+(ert-deftest test-default-template/no-ocr-in-template ()
+  "OCR text in context is NOT automatically included in default template."
+  (let* ((ctx '(:app-name "Safari"
+                :window-title "Page"
+                :uri nil
+                :ocr-text "Should not appear"))
+         (tmpl (org-capture-hs-default-template ctx)))
+    (should-not (string-match-p "Should not appear" tmpl))
+    (should-not (string-match-p "begin_quote" tmpl))))
+
 ;;; --- local/org-capture-hs-template (simulated from init-local-org.el) ---
 ;;
 ;; We define a local copy here to test the concat-based template builder
@@ -190,6 +291,7 @@ If format were used, %% would collapse to % and corrupt the template."
          (title (plist-get context :window-title))
          (uri (plist-get context :uri))
          (use-clipboard (plist-get context :use-clipboard))
+         (screenshot-rel (plist-get context :screenshot-rel))
          (tag (if app-name
                   (replace-regexp-in-string "\\s-" "" (downcase app-name))
                 "app"))
@@ -207,6 +309,10 @@ If format were used, %% would collapse to % and corrupt the template."
      ":ID:       %(org-id-new)\n"
      ":CREATED:  %U\n"
      ":END:\n\n"
+     (when screenshot-rel
+       (concat "[[file:"
+               (org-capture-hs-escape-percent screenshot-rel)
+               "]]\n\n"))
      clipboard-contents
      "%?\n")))
 
@@ -280,6 +386,62 @@ If format were used, %% would collapse to % and corrupt the template."
                 :use-clipboard nil))
          (tmpl (test--local-template ctx)))
     (should-not (string-match-p "quoted text" tmpl))))
+
+(ert-deftest test-local-template/with-screenshot ()
+  "Local template includes screenshot inline link."
+  (let* ((ctx '(:app-name "Safari"
+                :window-title "Page"
+                :uri nil
+                :screenshot-rel "images/shot.png"))
+         (tmpl (test--local-template ctx)))
+    (should (string-match-p "\\[\\[file:images/shot\\.png\\]\\]" tmpl))
+    ;; Screenshot link comes after :END:
+    (should (< (string-match ":END:" tmpl)
+               (string-match "\\[\\[file:" tmpl)))))
+
+(ert-deftest test-local-template/screenshot-with-percent ()
+  "Percent in screenshot path is escaped in local template."
+  (let* ((ctx '(:app-name "Test"
+                :window-title "Page"
+                :uri nil
+                :screenshot-rel "images/100%25.png"))
+         (tmpl (test--local-template ctx)))
+    (should (string-match-p "100%%25" tmpl))))
+
+(ert-deftest test-local-template/screenshot-no-uri ()
+  "Screenshot capture without URI uses window title as heading."
+  (let* ((ctx '(:app-name "Ghostty"
+                :window-title "~/projects"
+                :uri nil
+                :screenshot-rel "images/shot.png"))
+         (tmpl (test--local-template ctx)))
+    (should (string-prefix-p "* ~/projects :ghostty:note:" tmpl))
+    (should (string-match-p "\\[\\[file:images/shot\\.png\\]\\]" tmpl))))
+
+;;; --- org-capture-hs--delete-screenshot ---
+
+(ert-deftest test-delete-screenshot/deletes-file ()
+  "Screenshot file is deleted when context has :screenshot-path."
+  (let* ((tmp (make-temp-file "hs-screenshot" nil ".png")))
+    (unwind-protect
+        (progn
+          (should (file-exists-p tmp))
+          (org-capture-hs--delete-screenshot `(:screenshot-path ,tmp))
+          (should-not (file-exists-p tmp)))
+      (when (file-exists-p tmp) (delete-file tmp)))))
+
+(ert-deftest test-delete-screenshot/nil-path ()
+  "nil screenshot-path does nothing."
+  (org-capture-hs--delete-screenshot '(:screenshot-path nil))
+  ;; No error
+  )
+
+(ert-deftest test-delete-screenshot/nonexistent-file ()
+  "Non-existent file does nothing."
+  (org-capture-hs--delete-screenshot
+   '(:screenshot-path "/tmp/no-such-file-99999.png"))
+  ;; No error
+  )
 
 (provide 'test-org-capture-hs)
 

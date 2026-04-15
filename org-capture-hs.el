@@ -89,6 +89,11 @@ Runs while the capture buffer is still alive."
   :type '(alist :key-type symbol :value-type sexp)
   :group 'org-capture-hs)
 
+(defcustom org-capture-hs-screenshot-subdir "images"
+  "Subdirectory name for screenshots, relative to the capture target file."
+  :type 'string
+  :group 'org-capture-hs)
+
 ;;;; Buffer-local state
 
 (defvar-local org-capture-hs--context nil
@@ -142,6 +147,33 @@ Set in the capture buffer by `org-capture-mode-hook'.")
       (replace-regexp-in-string "%" "%%" str)
     ""))
 
+;;;; Screenshot placement
+
+(defun org-capture-hs--place-screenshot (tmp-path target)
+  "Move screenshot from TMP-PATH to a subdirectory alongside TARGET org file.
+TARGET is an org-capture target specification like (file \"/path/to/file.org\").
+Returns the final absolute path of the screenshot, or nil on failure."
+  (when (and tmp-path (file-exists-p tmp-path))
+    (let* ((target-file (pcase (car target)
+                          ('file (nth 1 target))
+                          (_ org-default-notes-file)))
+           (target-dir (file-name-directory (expand-file-name target-file)))
+           (img-dir (expand-file-name org-capture-hs-screenshot-subdir target-dir))
+           (filename (file-name-nondirectory tmp-path))
+           (dest (expand-file-name filename img-dir)))
+      (make-directory img-dir t)
+      (rename-file tmp-path dest t)
+      dest)))
+
+(defun org-capture-hs--screenshot-relative-path (screenshot-path target)
+  "Return the path of SCREENSHOT-PATH relative to the TARGET org file directory."
+  (when screenshot-path
+    (let* ((target-file (pcase (car target)
+                          ('file (nth 1 target))
+                          (_ org-default-notes-file)))
+           (target-dir (file-name-directory (expand-file-name target-file))))
+      (file-relative-name screenshot-path target-dir))))
+
 ;;;; Default template and target
 
 (defun org-capture-hs--make-org-link (uri title)
@@ -158,14 +190,21 @@ Return TITLE if URI is nil or empty."
     (or title "")))
 
 (defun org-capture-hs-default-template (context)
-  "Build a default capture template with org link when URI is available."
+  "Build a default capture template with org link when URI is available.
+Screenshot is included as an inline file link.  OCR text is not
+inserted automatically; use `org-capture-hs-run-ocr' in the capture
+buffer to insert it on demand."
   (let* ((uri (plist-get context :uri))
          (title (plist-get context :window-title))
+         (screenshot-rel (plist-get context :screenshot-rel))
          (heading (org-capture-hs-escape-percent
                    (if uri
                        (org-capture-hs--make-org-link uri title)
                      (or title "capture")))))
-    (concat "* " heading "\n%?\n")))
+    (concat "* " heading "\n"
+            (when screenshot-rel
+              (concat "[[file:" (org-capture-hs-escape-percent screenshot-rel) "]]\n"))
+            "%?\n")))
 
 (defun org-capture-hs-default-target (_context)
   "Default capture target: `org-default-notes-file'."
@@ -206,6 +245,46 @@ Return TITLE if URI is nil or empty."
 
 (add-hook 'org-capture-mode-hook #'org-capture-hs--setup-capture-buffer)
 
+;;;; Screenshot cleanup on cancel
+
+(defun org-capture-hs--delete-screenshot (context)
+  "Delete the screenshot file associated with CONTEXT."
+  (let ((path (plist-get context :screenshot-path)))
+    (message "org-capture-hs: delete-screenshot path=%s" path)
+    (when (and path (file-exists-p path))
+      (delete-file path)
+      (message "org-capture-hs: deleted screenshot %s" path))))
+
+;;;; OCR command
+
+(defcustom org-capture-hs-ocr-languages '("ja" "en")
+  "Languages for OCR recognition, passed to the Swift Vision framework."
+  :type '(repeat string)
+  :group 'org-capture-hs)
+
+(defun org-capture-hs--ocr-script-path ()
+  "Return the path to the OCR Swift script."
+  (expand-file-name "ocr-screenshot.swift"
+                    (file-name-directory (locate-library "org-capture-hs"))))
+
+(defun org-capture-hs-run-ocr ()
+  "Run OCR on the screenshot associated with the current capture buffer.
+Insert the recognized text at point in a quote block."
+  (interactive)
+  (unless org-capture-hs--context
+    (user-error "Not in a Hammerspoon capture buffer"))
+  (let ((path (plist-get org-capture-hs--context :screenshot-path)))
+    (unless (and path (file-exists-p path))
+      (user-error "No screenshot file found"))
+    (let* ((script (org-capture-hs--ocr-script-path))
+           (output (with-output-to-string
+                     (with-current-buffer standard-output
+                       (call-process "swift" nil t nil script path)))))
+      (setq output (string-trim output))
+      (if (string-empty-p output)
+          (message "OCR: no text recognized")
+        (insert "#+begin_quote\n" output "\n#+end_quote\n")))))
+
 ;;;; Finalize / destroy hooks
 
 (defun org-capture-hs--before-finalize ()
@@ -233,12 +312,14 @@ Return TITLE if URI is nil or empty."
 (add-hook 'org-capture-after-finalize-hook #'org-capture-hs--after-finalize)
 
 (defun org-capture-hs--around-destroy (orig-fn &rest args)
-  "Save context before destroy, then clean up frame and notify Hammerspoon."
+  "Save context before destroy, then clean up frame and notify Hammerspoon.
+Also deletes the associated screenshot file."
   (let ((context org-capture-hs--context)
         (frame (when (frame-parameter nil 'org-capture-hs-frame)
                  (selected-frame))))
     (apply orig-fn args)
     (when context
+      (org-capture-hs--delete-screenshot context)
       (when (frame-live-p frame)
         (delete-frame frame))
       (org-capture-hs--notify-return context))))
@@ -248,12 +329,14 @@ Return TITLE if URI is nil or empty."
 (defun org-capture-hs--around-kill (orig-fn &rest args)
   "Save context before kill, then clean up frame and notify Hammerspoon.
 `org-capture-kill' does not go through `org-capture-destroy' or the
-finalize hooks, so we need separate advice here."
+finalize hooks, so we need separate advice here.
+Also deletes the associated screenshot file."
   (let ((context org-capture-hs--context)
         (frame (when (frame-parameter nil 'org-capture-hs-frame)
                  (selected-frame))))
     (apply orig-fn args)
     (when context
+      (org-capture-hs--delete-screenshot context)
       (when (frame-live-p frame)
         (delete-frame frame))
       (org-capture-hs--notify-return context))))
@@ -264,7 +347,8 @@ finalize hooks, so we need separate advice here."
 
 ;;;###autoload
 (defun org-capture-hs-begin (app-name bundle-id window-id window-title
-                                      &optional uri use-clipboard)
+                                      &optional uri use-clipboard
+                                      screenshot-path)
   "Begin org-capture with context from Hammerspoon.
 
 APP-NAME is the source application name.
@@ -272,19 +356,36 @@ BUNDLE-ID is the source application bundle identifier.
 WINDOW-ID is the numeric window identifier.
 WINDOW-TITLE is the source window title.
 URI is an optional URL or file path from the source.
-USE-CLIPBOARD indicates whether the clipboard contains relevant content."
-  (let* ((context (list :app-name app-name
+USE-CLIPBOARD indicates whether the clipboard contains relevant content.
+SCREENSHOT-PATH is an optional path to a screenshot temp file."
+  (let* ((clean-uri (unless (or (null uri) (equal uri "")) uri))
+         (clean-screenshot (unless (or (null screenshot-path)
+                                       (equal screenshot-path ""))
+                             screenshot-path))
+         (context (list :app-name app-name
                         :bundle-id bundle-id
                         :window-id window-id
                         :window-title window-title
-                        :uri (unless (or (null uri) (equal uri "")) uri)
-                        :use-clipboard use-clipboard))
-         (template-str (funcall (or org-capture-hs-template-function
-                                    #'org-capture-hs-default-template)
-                                context))
+                        :uri clean-uri
+                        :use-clipboard use-clipboard
+                        :screenshot-path clean-screenshot))
          (target (funcall (or org-capture-hs-target-function
                               #'org-capture-hs-default-target)
                           context))
+         ;; Place screenshot and add relative/absolute paths to context
+         (final-screenshot (when clean-screenshot
+                             (org-capture-hs--place-screenshot
+                              clean-screenshot target)))
+         (screenshot-rel (when final-screenshot
+                           (org-capture-hs--screenshot-relative-path
+                            final-screenshot target)))
+         (context (if final-screenshot
+                      (plist-put (plist-put context :screenshot-path final-screenshot)
+                                 :screenshot-rel screenshot-rel)
+                    context))
+         (template-str (funcall (or org-capture-hs-template-function
+                                    #'org-capture-hs-default-template)
+                                context))
          (display-buffer-alist
           '(("^CAPTURE-"
              (display-buffer-same-window)
