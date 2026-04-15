@@ -1,0 +1,153 @@
+#+STARTUP: showall
+#+TITLE: orgCapture.spoon
+#+OPTIONS: ^:nil
+
+* Introduction
+
+This Hammerspoon Spoon launches =org-capture= in Emacs with context from the current macOS application. It captures the source app name, window title, URL (for browsers and Finder), and optionally the clipboard selection, passing everything to Emacs for a single-step capture workflow.
+
+1. User is in a non-Emacs application and presses the bound hotkey.
+2. Hammerspoon gathers context (app, title, URL, clipboard).
+3. Emacs opens a dedicated capture frame with a pre-filled template.
+4. User edits the capture entry.
+5. =C-c C-c= finalizes capture and returns focus to the source window.
+6. =C-c C-k= cancels capture and returns focus to the source window.
+
+* Requirements
+
+- Hammerspoon
+- Emacs with =org-mode= and a running =emacsclient= server
+- =hs= CLI (installed automatically by Hammerspoon's =hs.ipc= module)
+
+* Installation
+
+** Hammerspoon
+
+Place this folder inside =~/.hammerspoon/Spoons=:
+
+#+begin_src sh
+~/.hammerspoon/Spoons/orgCapture.spoon
+#+end_src
+
+Add to =~/.hammerspoon/init.lua=:
+
+#+begin_src lua
+hs.loadSpoon("orgCapture")
+if spoon.orgCapture then
+   spoon.orgCapture:bindHotkeys({
+      org_capture = { {"alt"}, "o" }
+   })
+end
+#+end_src
+
+*** Optional Hammerspoon configuration
+
+#+begin_src lua
+-- Path to emacsclient (default: /opt/homebrew/bin/emacsclient)
+spoon.orgCapture.emacsClientPath = "/opt/homebrew/bin/emacsclient"
+
+-- Emacs application name (default: "Emacs")
+spoon.orgCapture.emacsAppName = "Emacs"
+
+-- Delay after Cmd-C before reading clipboard, in microseconds (default: 500000)
+spoon.orgCapture.clipboardDelayMicros = 500000
+
+-- Enable debug logging to Hammerspoon Console (default: true)
+spoon.orgCapture.debugLogging = true
+#+end_src
+
+** Emacs
+
+Add =orgCapture.spoon= to the Emacs load path and require the library:
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path
+             (expand-file-name "~/.hammerspoon/Spoons/orgCapture.spoon"))
+(require 'org-capture-hs)
+#+end_src
+
+*** Customization
+
+The generic layer works out of the box with minimal defaults. For a more useful setup, configure these three functions:
+
+#+begin_src emacs-lisp
+;; Template function: receives context plist, returns an org-capture
+;; template string.  Context keys: :app-name, :bundle-id, :window-id,
+;; :window-title, :uri, :use-clipboard.
+(setq org-capture-hs-template-function #'my-template-function)
+
+;; Target function: receives context plist, returns an org-capture
+;; target specification like (file "/path/to/file.org").
+(setq org-capture-hs-target-function #'my-target-function)
+
+;; Cleanup function (optional): called before finalize with context plist.
+(setq org-capture-hs-cleanup-function #'my-cleanup-function)
+#+end_src
+
+Other customization options:
+
+#+begin_src emacs-lisp
+;; Display: 'dedicated-frame (default) or 'current-frame
+(setq org-capture-hs-display 'dedicated-frame)
+
+;; Dedicated frame appearance
+(setq org-capture-hs-frame-title "org-capture")
+(setq org-capture-hs-frame-width 80)
+(setq org-capture-hs-frame-height 40)
+;; (setq org-capture-hs-frame-left 100)
+;; (setq org-capture-hs-frame-top 100)
+;; (setq org-capture-hs-frame-parameters '((alpha . 0.95)))
+#+end_src
+
+* Supported URI sources
+
+| Application    | Method                          |
+|----------------+---------------------------------|
+| Safari         | AppleScript (native URL access) |
+| Google Chrome  | AppleScript (native URL access) |
+| Arc            | AppleScript (native URL access) |
+| Brave Browser  | AppleScript (native URL access) |
+| Firefox        | Keystroke (Cmd-L, Cmd-A, Cmd-C) |
+| Zen            | Keystroke (Cmd-L, Cmd-A, Cmd-C) |
+| Finder         | AppleScript (selected file or folder path) |
+| Other apps     | No URI; capture proceeds with app name and title only |
+
+When a URI is available, the capture heading is an org-mode link: =[[url][title]]=. When absent, the window title is used as the heading text.
+
+* Clipboard behavior
+
+If text is selected in the source application when the hotkey is pressed, Hammerspoon attempts to copy it via =Cmd-C=. Whether the copy succeeded is passed to the template function as =:use-clipboard=. The template function decides how to incorporate clipboard contents (e.g., as a quote block). Capture works regardless of whether clipboard content is available.
+
+* Testing
+
+** Automated tests
+
+#+begin_src sh
+emacs --batch -Q -L . -l test-org-capture-hs.el -f ert-run-tests-batch-and-exit
+#+end_src
+
+** Manual testing checklist
+
+- Browser: verify URL appears as an org link in the heading.
+- Finder: verify file path appears as a =file://= link.
+- General app: verify capture works without a URI.
+- With/without text selection: verify clipboard integration.
+- =C-c C-c=: finalizes and returns focus to the source window.
+- =C-c C-k=: cancels (with confirmation) and returns focus.
+- Multiple captures: verify contexts do not interfere.
+
+* Limitations
+
+- Firefox and Zen URI retrieval uses keystrokes to grab the URL from the address bar. This briefly activates the address bar and restores focus; it may not work with unusual browser configurations.
+- The hotkey is disabled while Emacs is in the foreground to avoid accidental triggers.
+- Clipboard copy relies on standard =Cmd-C=. Applications with non-standard clipboard behavior may not work.
+
+* Troubleshooting
+
+Debug messages are written to the Hammerspoon Console. Look for lines beginning with =orgCapture:=.
+
+Common issues:
+
+- =No Emacs found=: Emacs is not running. Start Emacs and ensure the =emacsclient= server is active.
+- =Failed to start org-capture in Emacs=: check that =org-capture-hs= is loaded and =emacsclient= path is correct.
+- =Could not return to source application=: the source window was closed before capture completed.
