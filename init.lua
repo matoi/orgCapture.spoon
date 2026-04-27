@@ -14,6 +14,9 @@ obj.license = "MIT - https://opensource.org/licenses/MIT"
 --- The name of the Emacs application.
 obj.emacsAppName = "Emacs"
 
+--- The bundle id of the Emacs application.
+obj.emacsBundleId = "org.gnu.Emacs"
+
 --- Path to emacsclient binary.
 obj.emacsClientPath = "/opt/homebrew/bin/emacsclient"
 
@@ -187,31 +190,39 @@ end
 
 -- Screenshot ------------------------------------------------------------
 
-local function takeScreenshot(mode, windowId)
+-- Returns {status = "ok"|"cancelled"|"error", path = <string?>}.
+-- "cancelled" means screencapture exited cleanly but no file was produced
+-- (e.g. user pressed Esc in selection mode).  "error" means the process
+-- itself failed.
+local function takeScreenshot(mode, ctx)
    local tmpPath = "/tmp/orgcapture-" .. os.date("%Y%m%d-%H%M%S") .. ".png"
    local args
    if mode == "screen" then
-      args = {"-x", tmpPath}
+      args = {"-x"}
+      if ctx.screenId then
+         table.insert(args, "-D")
+         table.insert(args, tostring(ctx.screenId))
+      end
+      table.insert(args, tmpPath)
    elseif mode == "window" then
-      args = {"-x", "-l" .. tostring(windowId), tmpPath}
+      args = {"-x", "-l" .. tostring(ctx.windowId), tmpPath}
    elseif mode == "selection" then
       args = {"-x", "-i", tmpPath}
    else
-      return nil
+      return {status = "error"}
    end
    local task = hs.task.new("/usr/sbin/screencapture", nil, args)
    task:start()
    task:waitUntilExit()
    if task:terminationStatus() ~= 0 then
-      return nil
+      return {status = "error"}
    end
-   -- Verify file was created
    local f = io.open(tmpPath, "r")
    if f then
       f:close()
-      return tmpPath
+      return {status = "ok", path = tmpPath}
    end
-   return nil
+   return {status = "cancelled"}
 end
 
 -- Begin capture ---------------------------------------------------------
@@ -227,7 +238,7 @@ function obj:beginOrgCapture(screenshotPath)
    local app = w:application()
    local appName = safeAppName(app) or "Unknown"
 
-   if appName == self.emacsAppName then
+   if app:bundleID() == self.emacsBundleId then
       self:log("already in Emacs, ignoring")
       hs.alert("Already in " .. self.emacsAppName .. ". Ignoring request")
       return
@@ -292,13 +303,26 @@ end
 local function screenshotAndCapture(obj, mode, ctx)
    obj:log("screenshot mode: " .. mode)
 
-   local screenshotPath = takeScreenshot(mode, ctx.windowId)
-   if not screenshotPath then
-      obj:log("screenshot failed or cancelled")
-      if mode == "selection" then return end
+   if mode == "window" and ctx.windowId and ctx.windowId > 0 then
+      local w = hs.window.get(ctx.windowId)
+      if w and w:isMinimized() then
+         obj:log("focused window is minimized, aborting")
+         hs.alert("Window is minimized")
+         return
+      end
+   end
+
+   local result = takeScreenshot(mode, ctx)
+   if result.status == "cancelled" then
+      obj:log("screenshot cancelled by user")
+      return
+   end
+   if result.status ~= "ok" then
+      obj:log("screenshot failed")
       hs.alert("Screenshot failed")
       return
    end
+   local screenshotPath = result.path
    obj:log("screenshot saved: " .. screenshotPath)
 
    -- Now safe to gather URI and clipboard (may trigger keystrokes/popups)
@@ -349,7 +373,7 @@ function obj:gatherScreenshotContext()
    local app = w:application()
    local appName = safeAppName(app) or "Unknown"
 
-   if appName == self.emacsAppName then
+   if app:bundleID() == self.emacsBundleId then
       self:log("already in Emacs, ignoring")
       hs.alert("Already in " .. self.emacsAppName .. ". Ignoring request")
       return nil
@@ -362,11 +386,19 @@ function obj:gatherScreenshotContext()
       return nil
    end
 
+   local screen = w:screen()
+   local screenId = nil
+   if screen then
+      local ok, id = pcall(function() return screen:id() end)
+      if ok then screenId = id end
+   end
+
    return {
       appName = appName,
       bundleId = app:bundleID() or "",
       windowId = w:id() or 0,
       windowTitle = safeWindowTitle(w),
+      screenId = screenId,
       emacs = emacs
    }
 end
@@ -493,7 +525,7 @@ end
 
 -- Disable hotkeys while Emacs is in front
 local appWatcher = hs.application.watcher.new(function(_, event, app)
-   if app:bundleID() == 'org.gnu.Emacs' then
+   if app:bundleID() == obj.emacsBundleId then
       if event == hs.application.watcher.activated then
          obj:unbindHotkeys()
       elseif event == hs.application.watcher.deactivated and obj.functionMap then
